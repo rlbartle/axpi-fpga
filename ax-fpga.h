@@ -51,8 +51,16 @@ struct ring_item {
 	u8 sample_rate_register;
 	u8 sample_rate;
 	u8 status; //byte not used for DMA transfer
-	u8 padding1; //temporary until SPI hardware driver bug fixed which causes the
-	u8 padding2; //output and data need to be word aligned for DMA to work..
+	
+
+	//temporary until SPI hardware driver bug fixed which causes the 
+	//output and data need to be word aligned for DMA to work..
+	u8 padding1; 
+	u8 padding2; 
+	u8 padding3;
+	//////////////
+
+	
 	//! the output and data are contiguous in memory so the DMA transfer will use the output pointer to begin the DMA
 	//transfer for the actual PCM data.
 //	union {
