@@ -32,7 +32,7 @@
 #define RING_BUFFER_SIZE (PAGE_SIZE*RING_BUFFER_ITEM_COUNT)
 
 #define RING_ITEM_SIZE PAGE_SIZE
-#define RING_ITEM_HEADER_SIZE (12)
+#define RING_ITEM_HEADER_SIZE (11)
 #define RING_ITEM_DATA_SIZE (RING_ITEM_SIZE - RING_ITEM_HEADER_SIZE)
 
 #define MMAP_STATUS_AVAILABLE 0		//userspace can write into
@@ -55,9 +55,7 @@ struct ring_item {
 
 	//temporary until SPI hardware driver bug fixed which causes the 
 	//output and data need to be word aligned for DMA to work..
-	u8 padding1; 
-	u8 padding2; 
-	u8 padding3;
+	u8 padding; 
 	//////////////
 
 	
