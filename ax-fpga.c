@@ -64,7 +64,6 @@ EXPORT_SYMBOL_GPL(ax_thread_cond);
 struct fgpa_data *fpga_buffers_alloc(struct device *dev)
 {
 	struct spi_transfer *t;
-	struct spi_message *m;
 	int i, j;
 	struct fgpa_data *data;
 	struct output_data *tx;
@@ -80,39 +79,27 @@ struct fgpa_data *fpga_buffers_alloc(struct device *dev)
 	for (; i<RING_BUFFER_COUNT; i++) {
 		tx = &data->tx[i];
 		init_waitqueue_head(&tx->wait_queue);
-		//tx->head = 0; //producer/writer/userspace
 		tx->tail = 0; //consumer/reader/kernel
-		//spin_lock_init(&tx->consumer_lock);
-		//INIT_LIST_HEAD(&tx->linked_list);		
 				
 		if ((tx->mem = dma_alloc_coherent(dev, RING_BUFFER_SIZE, &tx->dma_handle, GFP_DMA)) == NULL)
  			goto alloc_dma_fail;
- 			
- 		//Set the ring on the first page aligned boundary in mem.
-		tx->ring = tx->mem + (((size_t)tx->mem) & (PAGE_SIZE-1));
-						
+ 									
  		//pre-allocate spi_transfer and spi_message structs for each ring_item
- 		for (j = 0; j<RING_BUFFER_ITEM_COUNT; j++) {
- 			//SPI Message
- 			m = &tx->spi_message[j];
-			spi_message_init(m);
-			m->complete = fpga_transfer_complete;
-			m->is_dma_mapped = 1;
-			
-			//Enable S/PDIF output setting transfer
- 			t = &tx->enable_transfer[j];
- 			t->cs_change = 1;
- 			t->len = 2;
- 			
+ 		for (j = 0; j<RING_BUFFER_ITEM_COUNT; j++) {			
 			//Sample word size settings transfer
  			t = &tx->word_size_transfer[j];
- 			t->cs_change = 1;
  			t->len = 2;
+ 			t->cs_change = 1;
  			
  			//Sample rate settings transfer
  			t = &tx->sample_rate_transfer[j];
  			t->cs_change = 1;
  			t->len = 2;
+ 			
+ 			//Buffer state transfer
+			t = &tx->buffer_state_transfer[j];
+ 			t->len = 2;
+ 			t->cs_change = 1;
  							 			
  			//SPI PCM data transfer
  			t = &tx->pcm_transfer[j];
@@ -134,16 +121,8 @@ alloc_dma_fail:
 static int process_ring(struct output_data *tx)
 {
 	int i;
-	//u32 head;
 	u32 status;
 	struct ring_item *item;
-	
-	//spin_lock(&tx->consumer_lock);
-
-	//head = smp_load_acquire(&tx->head);
-	
-	//dma_rmb(); - dma_wmb();
-	//if (CIRC_CNT(head, tx->tail, RING_BUFFER_ITEM_COUNT) >= 1) {
 	
 	//must only perform a maximum of the ring size iterations at a time so that other rings
 	//have processing time too.
@@ -170,8 +149,7 @@ static int process_ring(struct output_data *tx)
 			break;
 		}
 	}
-	
-	//spin_unlock(&tx->consumer_lock);	
+
     return 0;
 }
 
@@ -238,97 +216,83 @@ static struct spi_driver fpga_spi_driver = {
 	
 static void fpga_transfer_complete(void *context)
 {
-	//int rl;
+	int rl;
 	struct output_data *tx;
 	struct ring_item *item = context;
 
 	//convert output from register address back into index
 	tx = &ax_driver->tx[(item->output & ~0x41) >> 1];	
+	
+	rl = printk_ratelimit();
+	if (rl)
+		printk(KERN_INFO "%s:BufferState:%.2x/%.2x FL:%d AL:%d", __FUNCTION__, item->buffer_state, item->buffer_state_register, tx->spi_message[(item - tx->ring)].frame_length, tx->spi_message[(item - tx->ring)].actual_length);
+		
 	item->status = MMAP_STATUS_AVAILABLE;
 	
 	//wake up any polling process
 	wmb(); /* force memory to sync */
 	wake_up_interruptible_sync_poll(&tx->wait_queue, POLLOUT);
-	//up(&ax_thread_cond);
 }
 
 static int fpga_transfer_spi(struct ring_item *item, u32 index)
 {
-	struct spi_transfer *t, *t2;
+	struct spi_transfer *t, *t2 = NULL;
 	struct spi_message *m;
 	struct output_data *tx;
-	u8 output;
-	bool first = true;
+	u8 output, word_size;
 	//int rl;
 		
 	output = item->output;
 	tx = &ax_driver->tx[output];
 	m = &tx->spi_message[index];
+	spi_message_init(m);
+	m->complete = fpga_transfer_complete;
 	m->context = item;	
+	m->is_dma_mapped = 1;
 	
-	//Check if settings have changed.  Add extra SPI transfers to set them.
-	if (tx->enabled != item->enable) {
-		//Enable output transfer (bitfield of all S/PDIF outputs.  bit set if on, clear if off)
-		item->enable_register = (0x01 << 1) | 0x01;
-		t = &tx->enable_transfer[index];
-		item->enable = (ax_driver->tx[0].enabled | (ax_driver->tx[1].enabled << 1) |
-							(ax_driver->tx[2].enabled << 2) | (ax_driver->tx[3].enabled << 3)) ^ 
-								(tx->enabled << output);
-		t->tx_buf = &item->enable_register;
 	
-		INIT_LIST_HEAD(&t->transfer_list);
-		INIT_LIST_HEAD(&m->transfers);
-		spi_message_add_tail(t, m);
-		first = false;
-		t2 = t;
-	}
-	if (tx->word_size != item->word_size) {
-		//Word size transfer (bitfield of all S/PDIF outputs.  bit set if 16bit, clear if 24bit)
-		item->word_size_register = (0x02 << 1) | 0x01;
-		t = &tx->word_size_transfer[index];
-		item->word_size = (ax_driver->tx[0].word_size | (ax_driver->tx[1].word_size << 1) |
-							(ax_driver->tx[2].word_size << 2) | (ax_driver->tx[3].word_size << 3)) ^ 
-								(tx->word_size << output);
-		t->tx_buf = &item->word_size_register;
-		
-		if (first) {
-			INIT_LIST_HEAD(&t->transfer_list);
-			INIT_LIST_HEAD(&m->transfers);
-			spi_message_add_tail(t, m);
-			first = false;
-		} else {
-			list_add_tail(&t->transfer_list, &t2->transfer_list);
-		}
-		t2 = t;
-	}
-	if (tx->sample_rate != item->sample_rate) {
-		//Sample rate transfer
-		item->sample_rate_register = ((0x10 + output) << 1) | 0x01;
-		t = &tx->sample_rate_transfer[index];
-		t->tx_buf = &item->sample_rate_register;
-		
-		if (first) {
-			INIT_LIST_HEAD(&t->transfer_list);
-			INIT_LIST_HEAD(&m->transfers);
-			spi_message_add_tail(t, m);
-			first = false;
-		} else {
-			list_add_tail(&t->transfer_list, &t2->transfer_list);
-		}
-		t2 = t;
-	}
-		
 	//Output select transfer
 	item->output = ((0x20 + output) << 1) | 0x01;
 	t = &tx->pcm_transfer[index];
 	t->tx_buf = &item->output; //right before the &item->data memory region..
+	t->tx_dma = tx->dma_handle + offsetof(struct ring_item, output);
 	t->len = item->data_len+1;
-	if (first) {
-		INIT_LIST_HEAD(&t->transfer_list);
-		INIT_LIST_HEAD(&m->transfers);
-		spi_message_add_tail(t, m);
-		first = false;
-	} else {
+	INIT_LIST_HEAD(&t->transfer_list);
+	spi_message_add_tail(t, m);
+	t2 = t;
+	
+	//Buffer state transfer
+	item->buffer_state_register = 0x00;//((0x18 + output) << 1) | 0x00;
+	t = &tx->buffer_state_transfer[index];
+	t->tx_buf = &item->buffer_state_register;
+	t->rx_buf = &item->buffer_state_register; //first byte read is garbage, second is the data we want
+	list_add_tail(&t->transfer_list, &t2->transfer_list);
+	t2 = t;
+	
+	//Check if settings have changed.  Add extra SPI transfers to set them.
+	if (tx->sample_rate != item->sample_rate) {
+		tx->sample_rate = item->sample_rate;
+		//Sample rate transfer
+		item->sample_rate_register = ((0x10 + output) << 1) | 0x01;
+		t = &tx->sample_rate_transfer[index];
+		t->tx_buf = &item->sample_rate_register;
+		//t->rx_buf = &item->sample_rate_register;	
+		list_add_tail(&t->transfer_list, &t2->transfer_list);
+		t2 = t;
+	}	
+	
+	if (tx->word_size != item->word_size) {
+		//Word size transfer (bitfield of all S/PDIF outputs.  bit set if 16bit, clear if 24bit)
+		word_size =  item->word_size;
+		item->word_size_register = (0x02 << 1) | 0x01;
+		t = &tx->word_size_transfer[index];
+		item->word_size = (ax_driver->tx[0].word_size | (ax_driver->tx[1].word_size << 1) |
+							(ax_driver->tx[2].word_size << 2) | (ax_driver->tx[3].word_size << 3)) ^ 
+								(word_size << output);
+		tx->word_size = word_size;					
+								
+		t->tx_buf = &item->word_size_register;
+		//t->rx_buf = &item->word_size_register;	
 		list_add_tail(&t->transfer_list, &t2->transfer_list);
 	}
 		
@@ -337,9 +301,6 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 	//if (rl)
 	//	//printk(KERN_INFO "%s: ", __FUNCTION__);
 	//printk(KERN_INFO "%s: Output:%d Length:%d", __FUNCTION__, output, item->data_len);
-
-//why?
-//AX-FPGAv1 spi0.0: Unaligned spi tx-transfer bridging page
 
 	return !end_thread && spi_async(ax_driver->spi, m);
 }
@@ -400,48 +361,3 @@ MODULE_ALIAS("AX-FPGAv1");
 MODULE_DESCRIPTION("Axium FPGA driver for Raspberry Pi");
 MODULE_AUTHOR("Robert Bartle <robert@axium.co.nz>");
 MODULE_LICENSE("GPL");
-
-
-
-//struct dma_memory_region {
-//	int mem_offset; //offset from the base
-//	int mem_size;   //size of this region
-//	struct list_head list;
-//};
-////Searches through currently used dma region to find a region with enough space for this transaction
-//static struct dma_memory_region *assign_dma_memory_region(u32 output, u32 required_len) {
-//	struct dma_memory_region *reg, *reg2;
-//	int offset = 0;
-//	struct list_head linked_list = &data->tx[output].linked_list;
-//
-//	if (!list_empty(linked_list)) 
-//	list_for_each_entry (reg, linked_list, list) { 
-//		offset = reg->mem_offset+reg->mem_size;
-//		
-//		//make sure the region fits the max size of the dma allocated memory
-//		if (required_len < RING_BUFFER_SIZE - offset)
-//			goto CONTINUE_MAIN_ITERATION;
-//		
-//		//make sure this region does not overlap any other region
-//		list_for_each_entry (reg2, linked_list, list)
-//			if (reg != reg2 && (reg2->mem_size+reg2->mem_offset > offset || offset+required_len > reg2->mem_offset))
-//    			goto CONTINUE_MAIN_ITERATION;
-//    	
-//    	//if execution reaches here, then the offset is valid..
-//    	break;
-//    	CONTINUE_MAIN_ITERATION:;
-//    	offset = -1;
-//    }
-//    
-//    if (offset != -1)  {
-//    	reg = kmalloc(sizeof(struct dma_memory_region), GFP_KERNEL);
-//    	if (reg != NULL) {
-//	    	reg->mem_offset = offset;
-//	    	reg->mem_size = required_len;
-//	    	INIT_LIST_HEAD(&reg->list);
-//	    	list_add(&reg->list, linked_list);
-//	    	return reg;
-//    	}
-//    }
-//    return NULL;
-//}
