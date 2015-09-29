@@ -32,7 +32,7 @@
 #define RING_BUFFER_SIZE (PAGE_SIZE*RING_BUFFER_ITEM_COUNT)
 
 #define RING_ITEM_SIZE PAGE_SIZE
-#define RING_ITEM_HEADER_SIZE (11)
+#define RING_ITEM_HEADER_SIZE (10)
 #define RING_ITEM_DATA_SIZE (RING_ITEM_SIZE - RING_ITEM_HEADER_SIZE)
 
 #define MMAP_STATUS_AVAILABLE 0		//userspace can write into
@@ -43,52 +43,41 @@
 #define dma_wmb()       dmb(oshst)
  
 struct ring_item {
-	u16 data_len; //bytes not used for DMA transfer
-	u8 enable_register;
-	u8 enable;
+	//These two bytes are not used for SPI transfer
+	u16 data_len; 
+	
+	//Bytes used in SPI transfers
 	u8 word_size_register;
 	u8 word_size;
 	u8 sample_rate_register;
 	u8 sample_rate;
-	u8 status; //byte not used for DMA transfer
+	u8 buffer_state_register;
+	u8 buffer_state;
+	u8 output;
+	char data[RING_ITEM_DATA_SIZE];
+	//
 	
-
-	//temporary until SPI hardware driver bug fixed which causes the 
-	//output and data need to be word aligned for DMA to work..
-	u8 padding; 
-	//////////////
-
-	
-	//! the output and data are contiguous in memory so the DMA transfer will use the output pointer to begin the DMA
-	//transfer for the actual PCM data.
-//	union {
-//		struct {
-			u8 output;
-			char data[RING_ITEM_DATA_SIZE];
-//		}
-//		char dma_data[RING_ITEM_DATA_SIZE+1];
-//	}
-
+	//byte not used for SPI transfer.  At the end so that output is word aligned
+	u8 status; 
 } __attribute__((packed));
 
 struct output_data {
-	void *mem; 						//CPU virtual address mapping
-	struct ring_item *ring; 		//Page align ring buffer memory region using mem
+	union {
+		void *mem; 						//CPU virtual address mapping
+		struct ring_item *ring;
+	};
 	dma_addr_t dma_handle; 			//DMA address mapping
-	//struct list_head linked_list; //list of dma_memory_region
-	//u32 head; 					//ring buffer head
 	u32 tail;						//ring buffer tail
 	wait_queue_head_t wait_queue;
-	//spinlock_t consumer_lock;
 	
-	struct spi_transfer enable_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_transfer word_size_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_transfer sample_rate_transfer[RING_BUFFER_ITEM_COUNT];
+	struct spi_transfer buffer_state_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_transfer pcm_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_message spi_message[RING_BUFFER_ITEM_COUNT];
-	u8 enabled;
 	u8 word_size;
 	u8 sample_rate;
+	u8 buffer_state;
 };
 
 struct fgpa_data {
