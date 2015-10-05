@@ -32,14 +32,14 @@ static struct spi_board_info fpga_spi_board_info[]  = {
 	{
 		.modalias = "AX-FPGAv1",
 		.max_speed_hz = 15625000, //15.625MHz
-		.mode = SPI_MODE_0,
+		.mode = SPI_MODE_1,
 		.chip_select = 0,
 		.platform_data = NULL,
 		.bus_num = 0
 	}, {
 		.modalias = "AX-FPGAv1",
 		.max_speed_hz = 15625000, //15.625MHz
-		.mode = SPI_MODE_0,
+		.mode = SPI_MODE_1,
 		.chip_select = 1,
 		.platform_data = NULL,
 		.bus_num = 0
