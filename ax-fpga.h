@@ -25,6 +25,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/semaphore.h>
 #include <linux/wait.h>
+#include <linux/time.h>
 #include <asm/atomic.h>
 
 #define RING_BUFFER_COUNT 4	 //4 S/PDIF outputs
@@ -47,12 +48,12 @@ struct ring_item {
 	u16 data_len; 
 	
 	//Bytes used in SPI transfers
+	u8 buffer_state_register;
+	u8 buffer_state;
 	u8 word_size_register;
 	u8 word_size;
 	u8 sample_rate_register;
 	u8 sample_rate;
-	u8 buffer_state_register;
-	u8 buffer_state;
 	u8 output;
 	char data[RING_ITEM_DATA_SIZE];
 	//
@@ -69,15 +70,39 @@ struct output_data {
 	dma_addr_t dma_handle; 			//DMA address mapping
 	u32 tail;						//ring buffer tail
 	wait_queue_head_t wait_queue;
+
+	//State variables for the output
+	u8 word_size;
+	u8 sample_rate;
+	u8 buffer_mode; //0 - ready to fill, 1 - is draining
+	struct timespec ts_start;
+	struct timespec ts_now;	
 	
+	u8 buffer_state_query;
+	u8 buffer_state;
+	u8 pausing;
+	u8 pause_state;
+	u8 flushing;
+	u8 flush_state;
+	
+	//Transfers and messages for each ring item
 	struct spi_transfer word_size_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_transfer sample_rate_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_transfer buffer_state_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_transfer pcm_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_message spi_message[RING_BUFFER_ITEM_COUNT];
-	u8 word_size;
-	u8 sample_rate;
-	u8 buffer_state;
+	
+	//Transfer and message for querying the buffer state
+	struct spi_transfer query_buffer_state_transfer;
+	struct spi_message query_spi_message;	
+	
+	//Transfer and message for triggering pause 
+	struct spi_transfer pause_transfer;
+	struct spi_message pause_spi_message;
+	
+	//Transfer and message for triggering flush 
+	struct spi_transfer flush_transfer;
+	struct spi_message flush_spi_message;
 };
 
 struct fgpa_data {
@@ -87,5 +112,8 @@ struct fgpa_data {
 
 extern struct fgpa_data *ax_driver;
 extern struct semaphore ax_thread_cond;
+
+int do_pause_transfer(struct output_data *tx, u8 param);
+int do_flush_transfer(struct output_data *tx);
 
 #endif /* __AX_FPGA_H */
