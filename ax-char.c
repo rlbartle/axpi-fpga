@@ -72,6 +72,10 @@ static int dev_open(struct inode * inod, struct file * filp)
 static int dev_close(struct inode * inod, struct file * filp)
 {
 	printk(KERN_INFO "dev_close\n");
+	struct output_data *tx = filp->private_data;
+	tx->pause_state = 0;
+	tx->buffer_state = 0;
+	tx->buffer_mode = 0;
 	filp->private_data = NULL;
 	dev_ref_count--;
 	return 0;
@@ -79,13 +83,13 @@ static int dev_close(struct inode * inod, struct file * filp)
 
 /**
  * Called when a 'read' system call is made on the device file.
- * This is the kernel informing the userspace that the ring buffer is usable again if it became full
+ * Currently unused.
+ * (maybe?) This is the kernel informing the userspace that the ring buffer is usable again if it became full
  */
 static ssize_t dev_read(struct file * filp, char __user * buff, size_t len, loff_t * off)
 {
 	printk(KERN_INFO "dev_read\n");
-	//TODO
-	put_user(1, buff);
+	//put_user(1, buff);
 	return 0;
 }
 
@@ -95,10 +99,38 @@ static ssize_t dev_read(struct file * filp, char __user * buff, size_t len, loff
  */
 static ssize_t dev_write(struct file * filp, const char __user * buff, size_t len, loff_t * off)
 {
-	//wake up the kernel ring buffer consumer thread if needed
-	up(&ax_thread_cond);
-
-	return 0;
+	int i;
+	struct ring_item *item;
+	u8 action[len];
+	struct output_data *tx = filp->private_data;
+	
+	if (copy_from_user(&action, buff, len) == 0) {
+		switch (action[0]) {
+			case 0: //standard ring progression
+				//wake up the kernel ring buffer consumer thread (if not already woken)
+				up(&ax_thread_cond);
+				break;
+			case 1: //pause
+				do_pause_transfer(tx, action[1]);
+				break;
+			case 2: //flush
+				do_flush_transfer(tx);
+				for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++) {
+				    item = (struct ring_item*) (tx->mem + (i * sizeof(struct ring_item)));
+					//status = ACCESS_ONCE(item->status);
+					if (ACCESS_ONCE(item->status) == MMAP_STATUS_SEND_REQUEST) {
+						item->status = MMAP_STATUS_AVAILABLE;
+						break;
+					}
+				}
+				wmb(); /* force memory to sync */
+				break;
+			default:
+				break;
+		}
+		return len;
+	}
+	return -1;
 }
 
 /**
@@ -127,8 +159,8 @@ static unsigned int dev_poll(struct file *filp, struct poll_table_struct *poll_t
 	struct output_data *tx;
 	unsigned int mask = 0;
 	
+	up(&ax_thread_cond);
 	tx = filp->private_data;
-	
 	poll_wait(filp, &tx->wait_queue, poll_table);	
 	
 	//the circular buffer is always used in order so the first free index is where the head (producer) is waiting
