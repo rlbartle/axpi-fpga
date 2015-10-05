@@ -54,7 +54,12 @@ module_init(ax_fpga_module_init);
 module_exit(ax_fpga_module_exit);
 
 static int fpga_transfer_spi(struct ring_item *item, u32 index);
+static int fpga_query_transfer_spi(struct output_data *tx);
 static void fpga_transfer_complete(void *context);
+static void fpga_query_transfer_complete(void *context);
+static void fpga_pause_transfer_complete(void *context);
+static void fpga_flush_transfer_complete(void *context);
+
 
 static bool end_thread = 0;
 static struct task_struct *thread;
@@ -100,10 +105,14 @@ struct fgpa_data *fpga_buffers_alloc(struct device *dev)
 			t = &tx->buffer_state_transfer[j];
  			t->len = 2;
  			t->cs_change = 1;
- 							 			
+ 		 							 			
  			//SPI PCM data transfer
  			t = &tx->pcm_transfer[j];
  		}
+ 		
+		tx->query_buffer_state_transfer.len = 2;
+		tx->pause_transfer.len = 2;
+		tx->flush_transfer.len = 2;	
 	}
 		
 	return data;
@@ -118,11 +127,25 @@ alloc_dma_fail:
 	return NULL;
 }
 
-static int process_ring(struct output_data *tx)
+static void process_ring(struct output_data *tx)
 {
 	int i;
 	u32 status;
 	struct ring_item *item;
+	
+	if (tx->buffer_mode) {
+		//The SPI slave SDRAM buffer is currently draining so instead of writing more data,
+		//'poll' the buffer state until it reaches a set level when data should be filled again.  
+				
+		//If there is not currently a transfer in progress, and that at least 10ms has gone by
+		//since the last buffer state query..
+		getnstimeofday(&tx->ts_now);
+		if (!tx->pause_state && tx->query_spi_message.context == NULL && (tx->ts_now.tv_sec * MSEC_PER_SEC) +
+			 (tx->ts_now.tv_nsec / NSEC_PER_MSEC) > (tx->ts_start.tv_sec * MSEC_PER_SEC) +
+			  (tx->ts_start.tv_nsec / NSEC_PER_MSEC) + 10)
+			fpga_query_transfer_spi(tx);
+		return;
+	}
 	
 	//must only perform a maximum of the ring size iterations at a time so that other rings
 	//have processing time too.
@@ -131,26 +154,21 @@ static int process_ring(struct output_data *tx)
 		status = ACCESS_ONCE(item->status);
 		if (status == MMAP_STATUS_SEND_REQUEST) {
 			dma_rmb(); /* do not process data until we own buffer */
-			
-			//printk(KERN_INFO "MMAP_STATUS_SEND_REQUEST :%d \n", tx->tail);
-			
+	
+			if (!fpga_transfer_spi(item, tx->tail))
+				//SPI slave is not ready to receive data
+				return;
+				
 			item->status = MMAP_STATUS_SENDING;
-			fpga_transfer_spi(item, tx->tail);
 			ACCESS_ONCE(tx->tail) = (tx->tail + 1) & (RING_BUFFER_ITEM_COUNT - 1);
 		} else if (status == MMAP_STATUS_SENDING) {
-			//printk(KERN_INFO "MMAP_STATUS_SENDING :%d \n", tx->tail);
-			
 			//caught up to the producer which still has pending data to go
 			break;
 		} else { //MMAP_STATUS_AVAILABLE
-			//printk(KERN_INFO "MMAP_STATUS_AVAILABLE :%d \n", tx->tail);
-			
 			//item is available - we are waiting on the producer to give us more data
 			break;
 		}
 	}
-
-    return 0;
 }
 
 int ax_thread_function(void *userdata)
@@ -188,12 +206,14 @@ static int fpga_driver_remove_spi(struct spi_device *spi)
 	struct fgpa_data *data = spi->dev.driver_data;
 	printk(KERN_INFO "%s\n", __FUNCTION__);
 	
-	end_thread = 1;
-	up(&ax_thread_cond);
-	kthread_stop(thread);
+	if (!end_thread) {
+		end_thread = 1;
+		up(&ax_thread_cond);
+		kthread_stop(thread);
+	}
 	
 	if (data)  {
-		struct output_data *tx;	
+		struct output_data *tx;
 		for (i=0; i<RING_BUFFER_COUNT; i++) {
 			tx = &data->tx[i];
 			dma_free_coherent(&spi->dev, RING_BUFFER_SIZE, (void*)tx->mem, tx->dma_handle);
@@ -216,22 +236,43 @@ static struct spi_driver fpga_spi_driver = {
 	
 static void fpga_transfer_complete(void *context)
 {
-	int rl;
 	struct output_data *tx;
 	struct ring_item *item = context;
 
-	//convert output from register address back into index
-	tx = &ax_driver->tx[(item->output & ~0x41) >> 1];	
-	
-	rl = printk_ratelimit();
-	if (rl)
-		printk(KERN_INFO "%s:BufferState:%.2x/%.2x FL:%d AL:%d", __FUNCTION__, item->buffer_state, item->buffer_state_register, tx->spi_message[(item - tx->ring)].frame_length, tx->spi_message[(item - tx->ring)].actual_length);
-		
+	//if (!end_thread) {
+	tx = &ax_driver->tx[(item->output & ~0x41) >> 1]; //convert output from register address back into index	 
+
+	tx->buffer_state = item->buffer_state;	
 	item->status = MMAP_STATUS_AVAILABLE;
-	
+		
 	//wake up any polling process
 	wmb(); /* force memory to sync */
 	wake_up_interruptible_sync_poll(&tx->wait_queue, POLLOUT);
+	//}
+}
+
+static void fpga_query_transfer_complete(void *context)
+{
+	struct output_data *tx = context;
+	if (tx->buffer_state <= 0x1C)
+		//buffer is approaching about 10% capacity filled.  It is time to resume normal(filling) buffer mode
+		tx->buffer_mode = 0;
+	tx->query_spi_message.context = NULL;	
+	getnstimeofday(&tx->ts_start);
+}
+
+static void fpga_pause_transfer_complete(void *context)
+{
+	struct output_data *tx = context;
+	tx->pausing = 0;
+}
+
+static void fpga_flush_transfer_complete(void *context)
+{
+	struct output_data *tx = context;
+	tx->flushing = 0;
+	tx->buffer_state = 0;
+	tx->buffer_mode = 0;
 }
 
 static int fpga_transfer_spi(struct ring_item *item, u32 index)
@@ -240,18 +281,30 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 	struct spi_message *m;
 	struct output_data *tx;
 	u8 output, word_size;
-	//int rl;
 		
 	output = item->output;
+	
 	tx = &ax_driver->tx[output];
+	
+	//If the buffer state reaches about 95% full (0xF0) then no more pcm transfers will be sent until the
+	//buffer state drops back down to about 10% (0x1C).  The userspace code simply polls until the ring buffer
+	//is ready, which is when the buffer has cleared up and the pending transfers on the ring have been sent.
+	
+	//Test the SPI slave SDRAM buffer state
+	if (tx->buffer_state >= 0xF0) {		
+		//buffer is approaching 95% full (~500 milliseconds of buffering left).
+		//Do not queue the message but leave the item in limbo until the buffer has drained somewhat.		
+		tx->buffer_mode = 1;
+		return 0;
+	}
+	
+	//Prepare SPI message
 	m = &tx->spi_message[index];
 	spi_message_init(m);
 	m->complete = fpga_transfer_complete;
 	m->context = item;	
 	m->is_dma_mapped = 1;
 	
-	
-	//Output select transfer
 	item->output = ((0x20 + output) << 1) | 0x01;
 	t = &tx->pcm_transfer[index];
 	t->tx_buf = &item->output; //right before the &item->data memory region..
@@ -262,13 +315,13 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 	t2 = t;
 	
 	//Buffer state transfer
-	item->buffer_state_register = 0x00;//((0x18 + output) << 1) | 0x00;
+	item->buffer_state_register = (0x18 + output) << 1;
 	t = &tx->buffer_state_transfer[index];
 	t->tx_buf = &item->buffer_state_register;
 	t->rx_buf = &item->buffer_state_register; //first byte read is garbage, second is the data we want
 	list_add_tail(&t->transfer_list, &t2->transfer_list);
 	t2 = t;
-	
+			
 	//Check if settings have changed.  Add extra SPI transfers to set them.
 	if (tx->sample_rate != item->sample_rate) {
 		tx->sample_rate = item->sample_rate;
@@ -276,10 +329,9 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 		item->sample_rate_register = ((0x10 + output) << 1) | 0x01;
 		t = &tx->sample_rate_transfer[index];
 		t->tx_buf = &item->sample_rate_register;
-		//t->rx_buf = &item->sample_rate_register;	
 		list_add_tail(&t->transfer_list, &t2->transfer_list);
 		t2 = t;
-	}	
+	}
 	
 	if (tx->word_size != item->word_size) {
 		//Word size transfer (bitfield of all S/PDIF outputs.  bit set if 16bit, clear if 24bit)
@@ -292,18 +344,69 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 		tx->word_size = word_size;					
 								
 		t->tx_buf = &item->word_size_register;
-		//t->rx_buf = &item->word_size_register;	
 		list_add_tail(&t->transfer_list, &t2->transfer_list);
 	}
-		
-	//these messages spam the log and cause big problems!
-	//rl = printk_ratelimit();
-	//if (rl)
-	//	//printk(KERN_INFO "%s: ", __FUNCTION__);
-	//printk(KERN_INFO "%s: Output:%d Length:%d", __FUNCTION__, output, item->data_len);
-
-	return !end_thread && spi_async(ax_driver->spi, m);
+	
+	return spi_async(ax_driver->spi, m) == 0;
 }
+
+static int fpga_query_transfer_spi(struct output_data *tx)
+{
+	u8 output = tx - ax_driver->tx;
+				
+	//Prepare SPI message
+	spi_message_init(&tx->query_spi_message);
+	tx->query_spi_message.complete = fpga_query_transfer_complete;
+	tx->query_spi_message.context = tx;
+	tx->buffer_state_query = (0x18 + output) << 1;
+	tx->buffer_state = 0;
+	tx->query_buffer_state_transfer.tx_buf = &tx->buffer_state_query;
+	tx->query_buffer_state_transfer.rx_buf = &tx->buffer_state_query;
+	INIT_LIST_HEAD(&tx->query_buffer_state_transfer.transfer_list);
+	spi_message_add_tail(&tx->query_buffer_state_transfer, &tx->query_spi_message);
+	
+	return spi_async(ax_driver->spi, &tx->query_spi_message);
+}
+
+int do_pause_transfer(struct output_data *tx, u8 param)
+{		
+	u8 output = tx - ax_driver->tx;
+	
+	if (tx->pausing)
+		return 0;
+				
+	//Prepare SPI message
+	spi_message_init(&tx->pause_spi_message);
+	tx->pause_spi_message.complete = fpga_pause_transfer_complete;
+	tx->pause_spi_message.context = tx;
+	tx->pausing = ((0x04 + output) << 1) | 0x01;
+	tx->pause_state = param;	
+	tx->pause_transfer.tx_buf = &tx->pausing;
+	INIT_LIST_HEAD(&tx->pause_transfer.transfer_list);
+	spi_message_add_tail(&tx->pause_transfer, &tx->pause_spi_message);
+	
+	return spi_async(ax_driver->spi, &tx->pause_spi_message);
+}
+
+int do_flush_transfer(struct output_data *tx)
+{
+	u8 output = tx - ax_driver->tx;
+		
+	if (tx->flushing)
+		return 0;
+				
+	//Prepare SPI message
+	spi_message_init(&tx->flush_spi_message);
+	tx->flush_spi_message.complete = fpga_flush_transfer_complete;
+	tx->flush_spi_message.context = tx;
+	tx->flushing = ((0x08 + output) << 1) | 0x01;
+	tx->flush_state = 1;
+	tx->flush_transfer.tx_buf = &tx->flushing;
+	INIT_LIST_HEAD(&tx->flush_transfer.transfer_list);
+	spi_message_add_tail(&tx->flush_transfer, &tx->flush_spi_message);
+	
+	return spi_async(ax_driver->spi, &tx->flush_spi_message);
+}		
      
 static int __init ax_fpga_module_init(void)
 {
@@ -322,7 +425,7 @@ static int __init ax_fpga_module_init(void)
 	
 	ret = ax_register_spi_driver(&fpga_spi_driver);
 	if (ret != 0) {
-		printk ("Failed to register spi driver\n");
+		printk(KERN_INFO "Failed to register spi driver\n");
 		return ret;
 	}
 	
@@ -338,7 +441,7 @@ static int __init ax_fpga_module_init(void)
 	
 	ret = ax_register_character_device(&character_device);
 	if (ret != 0) {
-		printk("Character device registration failed\n");	
+		printk(KERN_INFO "Character device registration failed\n");	
 		spi_unregister_driver(&fpga_spi_driver);
 		device_destroy(chardrv_class, device_number);
 		class_destroy(chardrv_class);
@@ -350,7 +453,7 @@ static int __init ax_fpga_module_init(void)
 
 static void __exit ax_fpga_module_exit(void)
 {
-	printk ("ax_fpga module unloaded\n");
+	printk(KERN_INFO "ax_fpga module unloaded\n");
 	spi_unregister_driver(&fpga_spi_driver);
 	device_destroy(chardrv_class, MKDEV(DEV_MAJOR, DEV_MINOR));
 	class_destroy(chardrv_class);
