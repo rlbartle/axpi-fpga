@@ -62,7 +62,7 @@ struct spdif_t {
 	u_int32_t wc, bna_c;
 #endif
 
-	SOCKET fpga_fd;
+	int fpga_fd;
 	struct iovec *ring;
 	unsigned int ring_offset;
 
@@ -91,6 +91,7 @@ struct spdif_t {
 	u_int8_t channels;
 };
 
+void init();
 struct spdif_t *spdif_initialise(u_int8_t output);
 void spdif_destroy(struct spdif_t *state);
 void prepare_spdif(struct spdif_t *state, ax_word_size word_size, ax_sample_rate sample_rate, unsigned int sample_channels);
