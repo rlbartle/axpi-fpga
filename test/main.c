@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "spdif.h"
+
+//Pass the output number as parameter (0 - 3)
 int main(int argc, char *argv[]) {
 
 	size_t data_len = 4096;
