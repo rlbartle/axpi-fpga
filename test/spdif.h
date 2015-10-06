@@ -10,6 +10,7 @@
 
 #include <sys/time.h>
 #include <poll.h>
+#include <sys/types.h>
 #ifndef bool
 #include <stdbool.h>
 #endif
@@ -66,7 +67,7 @@ struct spdif_t {
 	struct iovec *ring;
 	unsigned int ring_offset;
 
-	u_char output;
+	u_int8_t output;
 
 	bool do_buffer;
 	unsigned short buffered_len;
