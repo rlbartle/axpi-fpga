@@ -24,7 +24,8 @@
 #define MMAP_STATUS_SENDING 2		//kernel is processing
 
 #define dmb(option) __asm__ __volatile__ ("dmb " #option : : : "memory")
-#define dsb(option) __asm__ __volatile__ ("dsb " #option : : : "memory")
+
+static int kernel_sockets[4];
 
 void init() {
 	int i = 0;
