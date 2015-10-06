@@ -13,11 +13,12 @@
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include <sys/time.h>
 
-#include "spdif/spdif.h"
+#include "spdif.h"
 
 #define MMAP_STATUS_AVAILABLE 0		//userspace can write into
 #define MMAP_STATUS_SEND_REQUEST 1	//kernel can read
@@ -46,14 +47,10 @@ struct spdif_t *spdif_initialise(u_int8_t output) {
 	state->ring_offset = 0;
 
 	state->fpga_fd = kernel_sockets[output];
-	close(unix_domain_socket);
 	char *map;
 
 	/* Map circular ring. */
 	if ((map = mmap(NULL, FPGA_RING_ITEM_SIZE*FPGA_RING_ITEM_COUNT, PROT_READ | PROT_WRITE,
-			MAP_SHARED | MAP_LOCKED | MAP_POPULATE, state->fpga_fd, 0)) == MAP_FAILED &&
-		//if attempting to 'lock' the memory fails, then try again without lock
-		(map = mmap(NULL, FPGA_RING_ITEM_SIZE*FPGA_RING_ITEM_COUNT, PROT_READ | PROT_WRITE,
 			MAP_SHARED, state->fpga_fd, 0)) == MAP_FAILED) {
 		perror("mmap ring buffer");
 		state->ring = NULL;
@@ -66,7 +63,7 @@ struct spdif_t *spdif_initialise(u_int8_t output) {
 		state->ring[i].iov_base = map + (i * FPGA_RING_ITEM_SIZE);
 		state->ring[i].iov_len  = FPGA_RING_ITEM_SIZE;
 	}
-	
+
 #ifdef _AX_LOG_LATENCY_
 	gettimeofday(&state->t, NULL);
 	state->rt = 0;
@@ -106,7 +103,7 @@ int write_fpga_msg(struct spdif_t *state, const char *data, size_t data_len) {
 	size_t sent_data = 0;
 	u_int16_t size;
 	int p;
-	for (size_t remains = data_len; remains > 0 && !finish;) {
+	for (size_t remains = data_len; remains > 0;) {
 
 		header = state->ring[state->ring_offset].iov_base;
 
@@ -122,7 +119,7 @@ int write_fpga_msg(struct spdif_t *state, const char *data, size_t data_len) {
 			pollset.fd = state->fpga_fd;
 			pollset.events = POLLOUT;
 			pollset.revents = 0;
-			if (errno == EINTR || finish) {
+			if (errno == EINTR) {
 				errno = 0;
 				return -1;
 			} else if ((p = poll(&pollset, 1, 100)) < 0) {
@@ -201,7 +198,7 @@ int write_fpga_msg(struct spdif_t *state, const char *data, size_t data_len) {
 	gettimeofday(&state->t, NULL);
 	++state->wc;
 	if (((state->t.tv_sec*1000000) + state->t.tv_usec) - state->rt > 110000) {
-		printf("%u write(s) / %u bna(s) / %lu us / %u bytes\n", state->wc, state->bna_c, ((state->t.tv_sec*1000000) + state->t.tv_usec) - state->rt, data_len);
+		printf("%u write(s) / %u bna(s) / %llu us / %u bytes\n", state->wc, state->bna_c, ((state->t.tv_sec*1000000) + state->t.tv_usec) - state->rt, data_len);
 		state->wc = 0;
 		state->bna_c = 0;
 	}
