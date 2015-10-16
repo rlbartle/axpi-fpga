@@ -33,7 +33,7 @@
 #define RING_BUFFER_SIZE (PAGE_SIZE*RING_BUFFER_ITEM_COUNT)
 
 #define RING_ITEM_SIZE PAGE_SIZE
-#define RING_ITEM_HEADER_SIZE (10)
+#define RING_ITEM_HEADER_SIZE (12)
 #define RING_ITEM_DATA_SIZE (RING_ITEM_SIZE - RING_ITEM_HEADER_SIZE)
 
 #define MMAP_STATUS_AVAILABLE 0		//userspace can write into
@@ -56,6 +56,7 @@ struct ring_item {
 	u8 sample_rate;
 	u8 output;
 	char data[RING_ITEM_DATA_SIZE];
+	u16 padding;
 	//
 	
 	//byte not used for SPI transfer.  At the end so that output is word aligned
@@ -70,6 +71,7 @@ struct output_data {
 	dma_addr_t dma_handle; 			//DMA address mapping
 	u32 tail;						//ring buffer tail
 	wait_queue_head_t wait_queue;
+	spinlock_t ring_lock;
 
 	//State variables for the output
 	u8 word_size;
@@ -84,7 +86,7 @@ struct output_data {
 	u8 pause_state;
 	u8 flushing;
 	u8 flush_state;
-	
+		
 	//Transfers and messages for each ring item
 	struct spi_transfer word_size_transfer[RING_BUFFER_ITEM_COUNT];
 	struct spi_transfer sample_rate_transfer[RING_BUFFER_ITEM_COUNT];
