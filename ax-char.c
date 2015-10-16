@@ -71,8 +71,8 @@ static int dev_open(struct inode * inod, struct file * filp)
  */
 static int dev_close(struct inode * inod, struct file * filp)
 {
-	printk(KERN_INFO "dev_close\n");
 	struct output_data *tx = filp->private_data;
+	printk(KERN_INFO "dev_close\n");
 	tx->pause_state = 0;
 	tx->buffer_state = 0;
 	tx->buffer_mode = 0;
@@ -84,7 +84,6 @@ static int dev_close(struct inode * inod, struct file * filp)
 /**
  * Called when a 'read' system call is made on the device file.
  * Currently unused.
- * (maybe?) This is the kernel informing the userspace that the ring buffer is usable again if it became full
  */
 static ssize_t dev_read(struct file * filp, char __user * buff, size_t len, loff_t * off)
 {
@@ -114,16 +113,18 @@ static ssize_t dev_write(struct file * filp, const char __user * buff, size_t le
 				do_pause_transfer(tx, action[1]);
 				break;
 			case 2: //flush
-				do_flush_transfer(tx);
+				spin_lock(&tx->ring_lock);
 				for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++) {
-				    item = (struct ring_item*) (tx->mem + (i * sizeof(struct ring_item)));
-					//status = ACCESS_ONCE(item->status);
+				    item = &tx->ring[i];
 					if (ACCESS_ONCE(item->status) == MMAP_STATUS_SEND_REQUEST) {
 						item->status = MMAP_STATUS_AVAILABLE;
 						break;
 					}
 				}
+				tx->tail = 0; //reset buffer index
 				wmb(); /* force memory to sync */
+				spin_unlock(&tx->ring_lock);
+				do_flush_transfer(tx);
 				break;
 			default:
 				break;
@@ -139,14 +140,18 @@ static ssize_t dev_write(struct file * filp, const char __user * buff, size_t le
 static int dev_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	int i;
-	struct ring_item *item;
 	struct output_data *tx = filp->private_data;
-	tx->tail = 0; //reset buffer index
+	
+	//reset buffer index
+	tx->tail = 0; 
+	
 	//clear the statuses
-	for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++) {
-	    item = (struct ring_item*) (tx->mem + (i * sizeof(struct ring_item)));
-	    item->status = MMAP_STATUS_AVAILABLE;
-	}
+	for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++)
+	    tx->ring[i].status = MMAP_STATUS_AVAILABLE;
+	  
+	//ensure the output is not paused
+	do_pause_transfer(tx, 0);
+	
 	return dma_mmap_coherent(&ax_driver->spi->dev, vma, tx->mem, tx->dma_handle, RING_BUFFER_SIZE);
 }
 
@@ -155,28 +160,21 @@ static int dev_mmap(struct file *filp, struct vm_area_struct *vma)
  */
 static unsigned int dev_poll(struct file *filp, struct poll_table_struct *poll_table) {
 	int i;
-	struct ring_item *item;
 	struct output_data *tx;
 	unsigned int mask = 0;
 	
-	up(&ax_thread_cond);
 	tx = filp->private_data;
 	poll_wait(filp, &tx->wait_queue, poll_table);	
 	
 	//the circular buffer is always used in order so the first free index is where the head (producer) is waiting
 	for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++) {
-	    item = (struct ring_item*) (tx->mem + (i * sizeof(struct ring_item)));
-		//status = ACCESS_ONCE(item->status);
-		if (ACCESS_ONCE(item->status) == MMAP_STATUS_AVAILABLE) {
+		if (ACCESS_ONCE(tx->ring[i].status) == MMAP_STATUS_AVAILABLE) {
 			mask |= POLLOUT | POLLWRNORM; /* writable */
 			break;
 		}
-//		else if (status == MMAP_STATUS_SENDING) {
-//			
-//		} else { //MMAP_STATUS_SEND_REQUEST
-//			
-//		}
 	}
+	
+	up(&ax_thread_cond);
 	
 	return mask;
 }
