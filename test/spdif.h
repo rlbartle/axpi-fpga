@@ -19,7 +19,7 @@
 
 #define FPGA_RING_ITEM_SIZE 4096
 #define FPGA_RING_ITEM_COUNT 16
-#define FPGA_RING_ITEM_HDRLEN (10)
+#define FPGA_RING_ITEM_HDRLEN (12)
 
 extern u_int8_t finish;
 
@@ -50,6 +50,7 @@ typedef struct fpga_ring_item {
 	ax_sample_rate sample_rate;
 	u_int8_t output;
 	char data[FPGA_RING_ITEM_SIZE-FPGA_RING_ITEM_HDRLEN];
+	u_int16_t padding; //used to make sure in 16bit mode the left/right channels are paired
 	//////////////////////////////
 
 	//byte not used for SPI transfer.  At the end so that output is word aligned
