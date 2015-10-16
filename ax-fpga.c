@@ -60,7 +60,6 @@ static void fpga_query_transfer_complete(void *context);
 static void fpga_pause_transfer_complete(void *context);
 static void fpga_flush_transfer_complete(void *context);
 
-
 static bool end_thread = 0;
 static struct task_struct *thread;
 struct semaphore ax_thread_cond;
@@ -68,8 +67,7 @@ EXPORT_SYMBOL_GPL(ax_thread_cond);
  
 struct fgpa_data *fpga_buffers_alloc(struct device *dev)
 {
-	struct spi_transfer *t;
-	int i, j;
+	int i;
 	struct fgpa_data *data;
 	struct output_data *tx;
 	
@@ -85,34 +83,10 @@ struct fgpa_data *fpga_buffers_alloc(struct device *dev)
 		tx = &data->tx[i];
 		init_waitqueue_head(&tx->wait_queue);
 		tx->tail = 0; //consumer/reader/kernel
-				
+		spin_lock_init(&tx->ring_lock);
+		
 		if ((tx->mem = dma_alloc_coherent(dev, RING_BUFFER_SIZE, &tx->dma_handle, GFP_DMA)) == NULL)
  			goto alloc_dma_fail;
- 									
- 		//pre-allocate spi_transfer and spi_message structs for each ring_item
- 		for (j = 0; j<RING_BUFFER_ITEM_COUNT; j++) {			
-			//Sample word size settings transfer
- 			t = &tx->word_size_transfer[j];
- 			t->len = 2;
- 			t->cs_change = 1;
- 			
- 			//Sample rate settings transfer
- 			t = &tx->sample_rate_transfer[j];
- 			t->cs_change = 1;
- 			t->len = 2;
- 			
- 			//Buffer state transfer
-			t = &tx->buffer_state_transfer[j];
- 			t->len = 2;
- 			t->cs_change = 1;
- 		 							 			
- 			//SPI PCM data transfer
- 			t = &tx->pcm_transfer[j];
- 		}
- 		
-		tx->query_buffer_state_transfer.len = 2;
-		tx->pause_transfer.len = 2;
-		tx->flush_transfer.len = 2;	
 	}
 		
 	return data;
@@ -147,6 +121,7 @@ static void process_ring(struct output_data *tx)
 		return;
 	}
 	
+	spin_lock(&tx->ring_lock);
 	//must only perform a maximum of the ring size iterations at a time so that other rings
 	//have processing time too.
 	for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++) {
@@ -155,9 +130,11 @@ static void process_ring(struct output_data *tx)
 		if (status == MMAP_STATUS_SEND_REQUEST) {
 			dma_rmb(); /* do not process data until we own buffer */
 	
-			if (!fpga_transfer_spi(item, tx->tail))
+			if (!fpga_transfer_spi(item, tx->tail)) {
 				//SPI slave is not ready to receive data
+				spin_unlock(&tx->ring_lock);	
 				return;
+			}
 				
 			item->status = MMAP_STATUS_SENDING;
 			ACCESS_ONCE(tx->tail) = (tx->tail + 1) & (RING_BUFFER_ITEM_COUNT - 1);
@@ -169,6 +146,7 @@ static void process_ring(struct output_data *tx)
 			break;
 		}
 	}
+	spin_unlock(&tx->ring_lock);	
 }
 
 int ax_thread_function(void *userdata)
@@ -246,9 +224,8 @@ static void fpga_transfer_complete(void *context)
 	item->status = MMAP_STATUS_AVAILABLE;
 		
 	//wake up any polling process
-	wmb(); /* force memory to sync */
-	wake_up_interruptible_sync_poll(&tx->wait_queue, POLLOUT);
-	//}
+	wake_up_poll(&tx->wait_queue, POLLOUT);
+	//}	
 }
 
 static void fpga_query_transfer_complete(void *context)
@@ -277,7 +254,7 @@ static void fpga_flush_transfer_complete(void *context)
 
 static int fpga_transfer_spi(struct ring_item *item, u32 index)
 {
-	struct spi_transfer *t, *t2 = NULL;
+	struct spi_transfer *t;
 	struct spi_message *m;
 	struct output_data *tx;
 	u8 output, word_size;
@@ -305,47 +282,52 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 	m->context = item;	
 	m->is_dma_mapped = 1;
 	
-	item->output = ((0x20 + output) << 1) | 0x01;
-	t = &tx->pcm_transfer[index];
-	t->tx_buf = &item->output; //right before the &item->data memory region..
-	t->tx_dma = tx->dma_handle + offsetof(struct ring_item, output);
-	t->len = item->data_len+1;
-	INIT_LIST_HEAD(&t->transfer_list);
-	spi_message_add_tail(t, m);
-	t2 = t;
-	
-	//Buffer state transfer
-	item->buffer_state_register = (0x18 + output) << 1;
-	t = &tx->buffer_state_transfer[index];
-	t->tx_buf = &item->buffer_state_register;
-	t->rx_buf = &item->buffer_state_register; //first byte read is garbage, second is the data we want
-	list_add_tail(&t->transfer_list, &t2->transfer_list);
-	t2 = t;
-			
-	//Check if settings have changed.  Add extra SPI transfers to set them.
-	if (tx->sample_rate != item->sample_rate) {
-		tx->sample_rate = item->sample_rate;
-		//Sample rate transfer
-		item->sample_rate_register = ((0x10 + output) << 1) | 0x01;
-		t = &tx->sample_rate_transfer[index];
-		t->tx_buf = &item->sample_rate_register;
-		list_add_tail(&t->transfer_list, &t2->transfer_list);
-		t2 = t;
-	}
-	
 	if (tx->word_size != item->word_size) {
 		//Word size transfer (bitfield of all S/PDIF outputs.  bit set if 16bit, clear if 24bit)
 		word_size =  item->word_size;
 		item->word_size_register = (0x02 << 1) | 0x01;
 		t = &tx->word_size_transfer[index];
+		memset(t, 0, sizeof(struct spi_transfer));
 		item->word_size = (ax_driver->tx[0].word_size | (ax_driver->tx[1].word_size << 1) |
 							(ax_driver->tx[2].word_size << 2) | (ax_driver->tx[3].word_size << 3)) ^ 
 								(word_size << output);
-		tx->word_size = word_size;					
-								
+		tx->word_size = word_size;	
 		t->tx_buf = &item->word_size_register;
-		list_add_tail(&t->transfer_list, &t2->transfer_list);
+		t->cs_change = 1;
+ 		t->len = 2;
+		spi_message_add_tail(t, m);
 	}
+	
+	if (tx->sample_rate != item->sample_rate) {
+		tx->sample_rate = item->sample_rate;
+		//Sample rate transfer
+		item->sample_rate_register = ((0x10 + output) << 1) | 0x01;
+		t = &tx->sample_rate_transfer[index];
+		memset(t, 0, sizeof(struct spi_transfer));
+		t->tx_buf = &item->sample_rate_register;
+		t->cs_change = 1;
+ 		t->len = 2;
+		spi_message_add_tail(t, m);
+	}
+	
+	//Buffer state transfer
+	item->buffer_state_register = (0x18 + output) << 1;
+	t = &tx->buffer_state_transfer[index];
+	memset(t, 0, sizeof(struct spi_transfer));
+	t->tx_buf = &item->buffer_state_register;
+	t->rx_buf = &item->buffer_state_register; //first byte read is garbage, second is the data we want
+	t->cs_change = 1;
+ 	t->len = 2;
+	spi_message_add_tail(t, m);
+	
+	//Finally the main data transfer
+	item->output = ((0x20 + output) << 1) | 0x01;
+	t = &tx->pcm_transfer[index];
+	memset(t, 0, sizeof(struct spi_transfer));
+	t->tx_buf = &item->output; //right before the &item->data memory region..
+	t->tx_dma = tx->dma_handle + offsetof(struct ring_item, output);
+	t->len = item->data_len+1;
+	spi_message_add_tail(t, m);
 	
 	return spi_async(ax_driver->spi, m) == 0;
 }
@@ -356,13 +338,14 @@ static int fpga_query_transfer_spi(struct output_data *tx)
 				
 	//Prepare SPI message
 	spi_message_init(&tx->query_spi_message);
+	memset(&tx->query_buffer_state_transfer, 0, sizeof(struct spi_transfer));
 	tx->query_spi_message.complete = fpga_query_transfer_complete;
 	tx->query_spi_message.context = tx;
 	tx->buffer_state_query = (0x18 + output) << 1;
 	tx->buffer_state = 0;
 	tx->query_buffer_state_transfer.tx_buf = &tx->buffer_state_query;
 	tx->query_buffer_state_transfer.rx_buf = &tx->buffer_state_query;
-	INIT_LIST_HEAD(&tx->query_buffer_state_transfer.transfer_list);
+	tx->query_buffer_state_transfer.len = 2;
 	spi_message_add_tail(&tx->query_buffer_state_transfer, &tx->query_spi_message);
 	
 	return spi_async(ax_driver->spi, &tx->query_spi_message);
@@ -377,14 +360,15 @@ int do_pause_transfer(struct output_data *tx, u8 param)
 				
 	//Prepare SPI message
 	spi_message_init(&tx->pause_spi_message);
+	memset(&tx->pause_transfer, 0, sizeof(struct spi_transfer));
 	tx->pause_spi_message.complete = fpga_pause_transfer_complete;
 	tx->pause_spi_message.context = tx;
 	tx->pausing = ((0x04 + output) << 1) | 0x01;
 	tx->pause_state = param;	
 	tx->pause_transfer.tx_buf = &tx->pausing;
-	INIT_LIST_HEAD(&tx->pause_transfer.transfer_list);
+	tx->pause_transfer.len = 2;
 	spi_message_add_tail(&tx->pause_transfer, &tx->pause_spi_message);
-	
+
 	return spi_async(ax_driver->spi, &tx->pause_spi_message);
 }
 
@@ -397,12 +381,13 @@ int do_flush_transfer(struct output_data *tx)
 				
 	//Prepare SPI message
 	spi_message_init(&tx->flush_spi_message);
+	memset(&tx->flush_transfer, 0, sizeof(struct spi_transfer));
 	tx->flush_spi_message.complete = fpga_flush_transfer_complete;
 	tx->flush_spi_message.context = tx;
 	tx->flushing = ((0x08 + output) << 1) | 0x01;
 	tx->flush_state = 1;
 	tx->flush_transfer.tx_buf = &tx->flushing;
-	INIT_LIST_HEAD(&tx->flush_transfer.transfer_list);
+	tx->flush_transfer.len = 2;	
 	spi_message_add_tail(&tx->flush_transfer, &tx->flush_spi_message);
 	
 	return spi_async(ax_driver->spi, &tx->flush_spi_message);
