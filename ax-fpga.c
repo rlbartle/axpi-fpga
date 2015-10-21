@@ -234,6 +234,7 @@ static void fpga_query_transfer_complete(void *context)
 	if (tx->buffer_state <= 0x1C)
 		//buffer is approaching about 10% capacity filled.  It is time to resume normal(filling) buffer mode
 		tx->buffer_mode = 0;
+	
 	tx->query_spi_message.context = NULL;	
 	getnstimeofday(&tx->ts_start);
 }
@@ -272,6 +273,7 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 		//buffer is approaching 95% full (~500 milliseconds of buffering left).
 		//Do not queue the message but leave the item in limbo until the buffer has drained somewhat.		
 		tx->buffer_mode = 1;
+		getnstimeofday(&tx->ts_start);
 		return 0;
 	}
 	
@@ -335,7 +337,7 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 static int fpga_query_transfer_spi(struct output_data *tx)
 {
 	u8 output = tx - ax_driver->tx;
-				
+	
 	//Prepare SPI message
 	spi_message_init(&tx->query_spi_message);
 	memset(&tx->query_buffer_state_transfer, 0, sizeof(struct spi_transfer));
