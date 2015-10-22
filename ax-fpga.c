@@ -106,9 +106,9 @@ static void process_ring(struct output_data *tx)
 	int i;
 	u32 status;
 	struct ring_item *item;
-	
+		
 	if (tx->buffer_mode) {
-		//The SPI slave SDRAM buffer is currently draining so instead of writing more data,
+		//The SDRAM buffer is currently draining so instead of writing more data,
 		//'poll' the buffer state until it reaches a set level when data should be filled again.  
 				
 		//If there is not currently a transfer in progress, and that at least 10ms has gone by
@@ -131,7 +131,7 @@ static void process_ring(struct output_data *tx)
 			dma_rmb(); /* do not process data until we own buffer */
 	
 			if (!fpga_transfer_spi(item, tx->tail)) {
-				//SPI slave is not ready to receive data
+				//Is not ready to receive data
 				spin_unlock(&tx->ring_lock);	
 				return;
 			}
@@ -205,7 +205,7 @@ static int fpga_driver_remove_spi(struct spi_device *spi)
 
 static struct spi_driver fpga_spi_driver = {
 	.driver = {
-		.name   = "AX-FPGAv1",
+		.name   = "ax-fpga",
 		.owner  = THIS_MODULE
 	},
 	.probe  = fpga_driver_probe_spi,
@@ -222,7 +222,7 @@ static void fpga_transfer_complete(void *context)
 
 	tx->buffer_state = item->buffer_state;	
 	item->status = MMAP_STATUS_AVAILABLE;
-		
+			
 	//wake up any polling process
 	wake_up_poll(&tx->wait_queue, POLLOUT);
 	//}	
@@ -268,7 +268,7 @@ static int fpga_transfer_spi(struct ring_item *item, u32 index)
 	//buffer state drops back down to about 10% (0x1C).  The userspace code simply polls until the ring buffer
 	//is ready, which is when the buffer has cleared up and the pending transfers on the ring have been sent.
 	
-	//Test the SPI slave SDRAM buffer state
+	//Test the SDRAM buffer state
 	if (tx->buffer_state >= 0xF0) {		
 		//buffer is approaching 95% full (~500 milliseconds of buffering left).
 		//Do not queue the message but leave the item in limbo until the buffer has drained somewhat.		
@@ -417,10 +417,12 @@ static int __init ax_fpga_module_init(void)
 	}
 	
 	if (IS_ERR(chardrv_class = class_create(THIS_MODULE, DEV_NAME))) {
+		printk(KERN_INFO "Failed to class_create\n");
 		spi_unregister_driver(&fpga_spi_driver);
 		return PTR_ERR(chardrv_class);
 	}
 	if (IS_ERR(chardrv_device = device_create(chardrv_class, NULL, device_number, NULL, DEV_NAME))) {
+		printk(KERN_INFO "Failed to device_create\n");
 		spi_unregister_driver(&fpga_spi_driver);
 		class_destroy(chardrv_class);
 		return PTR_ERR(chardrv_device);
@@ -447,7 +449,8 @@ static void __exit ax_fpga_module_exit(void)
 	cdev_del(&character_device);
 }
 
-MODULE_ALIAS("AX-FPGAv1");
+//MODULE_ALIAS_CHARDEV(DEV_MAJOR, DEV_MINOR);
+MODULE_ALIAS("ax-fpga");
 MODULE_DESCRIPTION("Axium FPGA driver for Raspberry Pi");
 MODULE_AUTHOR("Robert Bartle <robert@axium.co.nz>");
 MODULE_LICENSE("GPL");
