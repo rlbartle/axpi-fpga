@@ -59,7 +59,7 @@ EXPORT_SYMBOL_GPL(ax_register_character_device);
  */
 static int dev_open(struct inode * inod, struct file * filp)
 {
-	if (dev_ref_count < RING_BUFFER_COUNT) {
+	if (dev_ref_count < RING_BUFFER_COUNT && ax_driver != NULL) {
 		filp->private_data = &ax_driver->tx[dev_ref_count++];
 		return 0;
 	}
@@ -116,10 +116,8 @@ static ssize_t dev_write(struct file * filp, const char __user * buff, size_t le
 				spin_lock(&tx->ring_lock);
 				for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++) {
 				    item = &tx->ring[i];
-					if (ACCESS_ONCE(item->status) == MMAP_STATUS_SEND_REQUEST) {
+					if (ACCESS_ONCE(item->status) == MMAP_STATUS_SEND_REQUEST)
 						item->status = MMAP_STATUS_AVAILABLE;
-						break;
-					}
 				}
 				tx->tail = 0; //reset buffer index
 				wmb(); /* force memory to sync */
@@ -149,7 +147,8 @@ static int dev_mmap(struct file *filp, struct vm_area_struct *vma)
 	for(i = 0; i < RING_BUFFER_ITEM_COUNT; i++)
 	    tx->ring[i].status = MMAP_STATUS_AVAILABLE;
 	  
-	//ensure the output is not paused
+	//ensure the output is flushed and not paused
+	do_flush_transfer(tx);
 	do_pause_transfer(tx, 0);
 	
 	return dma_mmap_coherent(&ax_driver->spi->dev, vma, tx->mem, tx->dma_handle, RING_BUFFER_SIZE);
